@@ -3,54 +3,360 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 //static char *iso_name = {"mac.iso"};
 //cc -g -Wall isomacprog.c -o isomacprog
 
+enum efi_kind { EFI_UNKNOWN = 0, EFI_PE32, EFI_PE64, EFI_FAT32, EFI_MACHO32, EFI_MACHO64, EFI_CORRUPT };
+
+static enum efi_kind detect_efi_kind(const unsigned char *buf, size_t size)
+{
+  if (size < 64) return EFI_UNKNOWN;
+  /* Check for 'MZ' DOS header */
+  if (buf[0] == 'M' && buf[1] == 'Z') {
+    if (size >= 0x40) {
+      uint32_t e_lfanew = (uint32_t)buf[0x3C] | ((uint32_t)buf[0x3D] << 8) | ((uint32_t)buf[0x3E] << 16) | ((uint32_t)buf[0x3F] << 24);
+      if (e_lfanew + 4 + 26 <= size) {
+        if (buf[e_lfanew] == 'P' && buf[e_lfanew+1] == 'E' && buf[e_lfanew+2] == 0 && buf[e_lfanew+3] == 0) {
+          uint16_t magic = (uint16_t)buf[e_lfanew + 24] | ((uint16_t)buf[e_lfanew + 25] << 8);
+          if (magic == 0x010b) return EFI_PE32;
+          if (magic == 0x020b) return EFI_PE64;
+          return EFI_UNKNOWN;
+        }
+        return EFI_CORRUPT;
+      }
+      return EFI_CORRUPT;
+    }
+    return EFI_UNKNOWN;
+  }
+
+  /* Try FAT32 signature at offset 0x52 */
+  if (size > 0x52 + 5) {
+    if (memcmp(buf + 0x52, "FAT32", 5) == 0) return EFI_FAT32;
+  }
+
+  /* Mach-O signatures (both endians) */
+  if (size >= 4) {
+    uint32_t mo = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    if (mo == 0xFEEDFACE || mo == 0xCEFAEDFE) return EFI_MACHO32;
+    if (mo == 0xFEEDFACF || mo == 0xCFFAEDFE) return EFI_MACHO64;
+  }
+
+  return EFI_UNKNOWN;
+}
+
+static void usage(const char *prog)
+{
+  fprintf(stderr, "Usage: %s [--check-only] [--scan N] [--backup] <input.iso> <output.iso>\n", prog);
+  fprintf(stderr, "  --check-only    Only detect EFI kind at the write target (no write/copy)\n");
+  fprintf(stderr, "  --scan N        Scan N sectors around target to find EFI signatures\n");
+  fprintf(stderr, "  --scan-all      Scan the whole ISO image for EFI signatures (slow)\n");
+  fprintf(stderr, "  --backup        Create a backup of the input as input.bak before copying\n");
+}
+
 int main(int argc, char **argv)
 {
-  int fd, ret;
+  int ifd = -1, ofd = -1, ret;
   unsigned char buf[2048 - 64];
   off_t lba;
   size_t buf_size = 2048 - 64;
 
-  if (argc < 2) {
-    fprintf(stderr, "No iso name assigned\n");
+  int check_only = 0;
+  int backup = 0;
+  int scan_sectors = 0;
+  int scan_all = 0;
+  
+  // Parse options
+  while (argc > 1 && argv[1][0] == '-') {
+    if (strcmp(argv[1], "--check-only") == 0) { check_only = 1; argc--; argv++; }
+    else if (strncmp(argv[1], "--scan", 6) == 0) {
+      // Accept '--scan' or '--scan=N'
+      if (argv[1][6] == '=') { scan_sectors = atoi(argv[1] + 7); argc--; argv++; }
+      else { argc--; argv++; if (argc > 1) { scan_sectors = atoi(argv[1]); argc--; argv++; } }
+    }
+    else if (strcmp(argv[1], "--backup") == 0) { backup = 1; argc--; argv++; }
+    else if (strcmp(argv[1], "--scan-all") == 0) { scan_all = 1; argc--; argv++; }
+    else if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) { usage(argv[0]); exit(0); }
+    else { fprintf(stderr, "Unknown option: %s\n", argv[1]); usage(argv[0]); exit(1); }
+  }
+
+  if (check_only) {
+    if (argc != 2) { usage(argv[0]); exit(1); }
+    char *input_name = argv[1];
+    // only detection mode
+    ifd = open(input_name, O_RDONLY);
+    if (ifd == -1) { perror(input_name); exit(1); }
+    struct stat st;
+    if (fstat(ifd, &st) == -1) { perror(input_name); close(ifd); exit(1); }
+    off_t lba;
+    unsigned char buf4[4];
+    if (lseek(ifd, (off_t) 32768 + 2048 + 71, SEEK_SET) == -1) { perror("seek lba"); close(ifd); exit(1); }
+    ret = read(ifd, buf4, 4);
+    if (ret != 4) { fprintf(stderr, "Cannot read LBA from %s\n", input_name); close(ifd); exit(1); }
+    lba = buf4[0] | (buf4[1] << 8) | (buf4[2] << 16) | (buf4[3] << 24);
+    off_t write_offset = lba * 2048 + 64;
+    size_t pre_read = buf_size;
+    if (write_offset + (off_t)pre_read > st.st_size) pre_read = (size_t)(st.st_size - write_offset);
+    unsigned char *prebuf = malloc(pre_read);
+    if (!prebuf) { fprintf(stderr, "malloc failed\n"); close(ifd); exit(1); }
+    if (lseek(ifd, write_offset, SEEK_SET) == -1) { perror("lseek"); free(prebuf); close(ifd); exit(1); }
+    ret = read(ifd, prebuf, pre_read);
+    if (ret == -1) { perror("read"); free(prebuf); close(ifd); exit(1); }
+    enum efi_kind ek = detect_efi_kind(prebuf, ret);
+    switch (ek) {
+      case EFI_PE32: printf("EFI Detected: efi32 (PE32)\n"); break;
+      case EFI_PE64: printf("EFI Detected: efi64 (PE32+)\n"); break;
+      case EFI_FAT32: printf("EFI Detected: fat32\n"); break;
+      case EFI_MACHO32: printf("EFI Detected: macho32\n"); break;
+      case EFI_MACHO64: printf("EFI Detected: macho64\n"); break;
+      case EFI_CORRUPT: printf("EFI Detected: corrupted\n"); break;
+      default: printf("EFI Detected: unknown\n"); break;
+    }
+    // If requested scan multiple sectors, do additional scanning
+    if (scan_sectors > 0) {
+      printf("Scanning up to %d sectors around target:\n", scan_sectors);
+      for (int s = -scan_sectors; s <= scan_sectors; ++s) {
+        off_t s_off = write_offset + s * 2048;
+        if (s_off < 0 || s_off >= st.st_size) continue;
+        size_t rsz = buf_size;
+        if (s_off + (off_t)rsz > st.st_size) rsz = (size_t)(st.st_size - s_off);
+        if (lseek(ifd, s_off, SEEK_SET) == -1) continue;
+        ret = read(ifd, buf, rsz);
+        if (ret <= 0) continue;
+        ek = detect_efi_kind(buf, ret);
+        if (ek != EFI_UNKNOWN) {
+          printf("  At offset %lld (sector %+d): ", (long long)s_off, s);
+          if (ek == EFI_PE32) printf("efi32\n");
+          else if (ek == EFI_PE64) printf("efi64\n");
+          else if (ek == EFI_FAT32) printf("fat32\n");
+          else if (ek == EFI_MACHO32) printf("macho32\n");
+          else if (ek == EFI_MACHO64) printf("macho64\n");
+          else if (ek == EFI_CORRUPT) printf("corrupt\n");
+        }
+      }
+    }
+    free(prebuf);
+    close(ifd);
+    exit(0);
+  }
+
+  if (argc < 3) {
+    usage(argv[0]); exit(1);
+  }
+  char *input_name = argv[1];
+  char *output_name = argv[2];
+  if (strcmp(input_name, output_name) == 0) {
+    fprintf(stderr, "Input and output filenames are identical; refuse to operate in-place.\n");
     exit(1);
   }
 
-  char *iso_name = argv[1];
+  printf("Öffne Input ISO-Datei: %s\n", input_name);
+  ifd = open(input_name, O_RDONLY);
+  if (ifd == -1)
+    goto err_ex;
+  printf("Input erfolgreich geöffnet (fd=%d)\n", ifd);
 
-  fd = open(iso_name, O_RDWR);
-  if (fd == -1)
+  /* Dateigröße abfragen und anzeigen */
+  struct stat st;
+  if (fstat(ifd, &st) == -1)
     goto err_ex;
-  if (lseek(fd, (off_t) 32768 + 2048 + 71, SEEK_SET) == -1)
+  printf("Input-Größe: %lld bytes\n", (long long)st.st_size);
+  
+  printf("Lese LBA-Adresse bei Offset %lld...\n", (long long)(32768 + 2048 + 71));
+  if (lseek(ifd, (off_t) 32768 + 2048 + 71, SEEK_SET) == -1)
     goto err_ex;
-  ret = read(fd, buf, 4);
+  ret = read(ifd, buf, 4);
   if (ret == -1)
     goto err_ex;
   if (ret < 4) {
-    fprintf(stderr, "Cannot read 4 bytes from %s\n", iso_name);
+    fprintf(stderr, "Cannot read 4 bytes from %s\n", input_name);
     exit(1);
   }
   lba = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
-  if (lseek(fd, lba * 2048 + 64, SEEK_SET) == -1)
+  printf("LBA gefunden: %lld (0x%llx)\n", (long long)lba, (unsigned long long)lba);
+  
+  off_t write_offset = lba * 2048 + 64;
+  /* Validierungschecks: Offset und Dateigröße */
+  if (lba <= 0) {
+    fprintf(stderr, "Ungültige LBA gefunden: %lld\n", (long long)lba);
+    exit(1);
+  }
+  if (write_offset < 0 || write_offset + (off_t)buf_size > st.st_size) {
+    fprintf(stderr, "Fehler: Schreibbereich (offset=%lld, size=%zu) liegt außerhalb der Datei (size=%lld)\n",
+            (long long)write_offset, buf_size, (long long)st.st_size);
+    exit(1);
+  }
+  printf("Schreibe %zu Nullbytes bei Offset %lld (0x%llx)...\n", 
+         buf_size, (long long)write_offset, (unsigned long long)write_offset);
+
+  /* Detect EFI type in the input at the write offset */
+  size_t pre_read = buf_size;
+  if (write_offset + (off_t)pre_read > st.st_size) pre_read = (size_t)(st.st_size - write_offset);
+  unsigned char *prebuf = malloc(pre_read);
+  if (!prebuf) {
+    fprintf(stderr, "Fehler: malloc() fehlgeschlagen (prebuf)\n");
+    goto err_ex;
+  }
+  if (lseek(ifd, write_offset, SEEK_SET) == -1) { free(prebuf); goto err_ex; }
+  ret = read(ifd, prebuf, pre_read);
+  if (ret == -1) { free(prebuf); goto err_ex; }
+  enum efi_kind ek = detect_efi_kind(prebuf, ret);
+  free(prebuf);
+  switch (ek) {
+    case EFI_PE32: printf("EFI Detected: efi32 (PE32)\n"); break;
+    case EFI_PE64: printf("EFI Detected: efi64 (PE32+)\n"); break;
+    case EFI_FAT32: printf("EFI Detected: fat32\n"); break;
+    case EFI_MACHO32: printf("EFI Detected: macho32\n"); break;
+    case EFI_MACHO64: printf("EFI Detected: macho64\n"); break;
+    case EFI_CORRUPT: printf("EFI Detected: corrupted\n"); break;
+    default: printf("EFI Detected: unknown\n"); break;
+  }
+
+  if (scan_all) {
+    printf("Scanning entire image for EFI signatures...\n");
+    unsigned char *sbuf = malloc(2048);
+    if (!sbuf) { fprintf(stderr, "malloc failed\n"); goto err_ex; }
+    off_t pos = 0;
+    int found = 0;
+    while (pos < st.st_size) {
+      size_t rsz = 2048;
+      if (pos + (off_t)rsz > st.st_size) rsz = (size_t)(st.st_size - pos);
+      if (lseek(ifd, pos, SEEK_SET) == -1) break;
+      ret = read(ifd, sbuf, rsz);
+      if (ret <= 0) break;
+      enum efi_kind ek2 = detect_efi_kind(sbuf, ret);
+      if (ek2 != EFI_UNKNOWN) {
+        const char *kname = "unknown";
+        if (ek2 == EFI_PE32) kname = "efi32";
+        else if (ek2 == EFI_PE64) kname = "efi64";
+        else if (ek2 == EFI_FAT32) kname = "fat32";
+        else if (ek2 == EFI_MACHO32) kname = "macho32";
+        else if (ek2 == EFI_MACHO64) kname = "macho64";
+        else if (ek2 == EFI_CORRUPT) kname = "corrupt";
+        printf("Found %s at offset %lld\n", kname, (long long)pos);
+        found = 1;
+      }
+      pos += 2048;
+    }
+    if (!found) printf("No EFI signatures found in full scan.\n");
+    free(sbuf);
+  }
+
+  /* Copy input to output (do not modify original) */
+  if (backup) {
+    char bakname[4096];
+    snprintf(bakname, sizeof(bakname), "%s.bak", input_name);
+    printf("Erstelle Backup: %s\n", bakname);
+    int bfd = open(bakname, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+    if (bfd == -1) perror(bakname);
+    else {
+      if (lseek(ifd, 0, SEEK_SET) == -1) goto err_ex;
+      ssize_t r2, w2;
+      size_t cbuf_sz2 = 65536;
+      unsigned char *cbuf2 = malloc(cbuf_sz2);
+      if (cbuf2) {
+        while ((r2 = read(ifd, cbuf2, cbuf_sz2)) > 0) {
+          unsigned char *p = cbuf2; ssize_t left = r2;
+          while (left > 0) {
+            w2 = write(bfd, p, left);
+            if (w2 == -1) { free(cbuf2); close(bfd); goto err_ex; }
+            left -= w2; p += w2;
+          }
+        }
+        free(cbuf2);
+      }
+      close(bfd);
+      if (lseek(ifd, 0, SEEK_SET) == -1) goto err_ex;
+    }
+  }
+  printf("Kopiere '%s' nach '%s'...\n", input_name, output_name);
+  ofd = open(output_name, O_RDWR | O_CREAT | O_TRUNC, st.st_mode & 0777);
+  if (ofd == -1) goto err_ex;
+  {
+    ssize_t r, w;
+    size_t cbuf_sz = 65536;
+    unsigned char *cbuf = malloc(cbuf_sz);
+    if (!cbuf) {
+      fprintf(stderr, "Fehler: malloc() fehlgeschlagen\n");
+      goto err_ex;
+    }
+    if (lseek(ifd, 0, SEEK_SET) == -1) {
+      free(cbuf);
+      goto err_ex;
+    }
+    while ((r = read(ifd, cbuf, cbuf_sz)) > 0) {
+      unsigned char *p = cbuf;
+      ssize_t left = r;
+      while (left > 0) {
+        w = write(ofd, p, left);
+        if (w == -1) {
+          free(cbuf);
+          goto err_ex;
+        }
+        left -= w;
+        p += w;
+      }
+    }
+    free(cbuf);
+    if (r == -1) goto err_ex;
+  }
+
+  if (lseek(ofd, write_offset, SEEK_SET) == -1)
     goto err_ex;
   memset(buf, 0, buf_size);
-  ret = write(fd, buf, buf_size);
+  ret = write(ofd, buf, buf_size);
   if (ret == -1)
     goto err_ex;
   if (ret < buf_size) {
-    fprintf(stderr, "Cannot write %d bytes to %s\n", (int) buf_size, iso_name);
+    fprintf(stderr, "Cannot write %d bytes to %s\n", (int) buf_size, output_name);
     exit(1);
   }
-  close(fd);
-  printf("done\n");
+  printf("Erfolgreich %d Bytes geschrieben\n", ret);
+  
+  // Wichtig: Daten auf Festplatte synchronisieren
+  printf("Synchronisiere Daten auf Festplatte...\n");
+  if (fsync(ofd) == -1) {
+    perror("fsync");
+    fprintf(stderr, "Warnung: fsync fehlgeschlagen, Daten möglicherweise nicht gespeichert\n");
+  } else {
+    printf("Daten erfolgreich synchronisiert\n");
+  }
+
+  /* Lese den Bereich zurück, um die Änderung zu verifizieren */
+  {
+    unsigned char vbuf[2048 - 64];
+    if (lseek(ofd, write_offset, SEEK_SET) == -1)
+      goto err_ex;
+      ret = read(ofd, vbuf, buf_size);
+    if (ret == -1)
+      goto err_ex;
+      if (ret != (int)buf_size) {
+        fprintf(stderr, "Warnung: Rücklesegröße ist %d, erwartet %zu\n", ret, buf_size);
+    }
+    int all_zero = 1;
+    for (size_t i = 0; i < (size_t)ret; ++i) {
+      if (vbuf[i] != 0) { all_zero = 0; break; }
+    }
+    if (all_zero)
+      printf("Verifikation: Bereich enthält nur Nullbytes (OK)\n");
+    else
+      printf("Verifikation: Bereich enthält nicht-Nullbytes (Fehler)\n");
+  }
+  
+  close(ifd);
+  close(ofd);
+  printf("\n✓ Fertig! Die Datei '%s' wurde erfolgreich geschrieben und modifiziert.\n", output_name);
   exit(0);
 err_ex:;
-  perror(iso_name);
+  if (ofd != -1) close(ofd);
+  if (ifd != -1) close(ifd);
+  /* Print both input and output context, since error may concern either */
+  fprintf(stderr, "Fehler beim Verarbeiten der Dateien '%s' und '%s': ", input_name, output_name);
+  perror("");
   exit(1);
 }
 
